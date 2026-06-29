@@ -1,40 +1,29 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Glass, glassValue } from '@samasante/liquid-glass';
 
 /**
- * CursorGlass — a fresh, demo-faithful reimplementation of the loupe from
- * glass.samasante.com.
+ * CursorGlass — demo-faithful liquid-glass loupe from glass.samasante.com,
+ * tuned to be more legible and to fade out when the cursor rests.
  *
- * The demo's Playground loupe (see samasante/liquid-glass/site/src/
- * components/GlassDemo.tsx) uses:
+ * Wiring mirrors the demo's GlassDemo.tsx exactly:
+ *   <Glass refract={<PageScene />} pixelUnits behind={pageBg}
+ *          center={{ x: mv, y: mv }} width={...} height={...} radius={...}
+ *          style={{ position:'absolute', inset:0 }} />
  *
- *   <Glass
- *     refract={<Scene dark grid scale />}
- *     pixelUnits
- *     behind={pageBg}
- *     optics={DEFAULT_LENS}
- *     center={{ x: glassValue, y: glassValue }}
- *     width={glassValue} height={glassValue} radius={glassValue}
- *     style={{ position: "absolute", inset: 0 }}
- *   />
- *
- * …inside a bounded stage. Here we use the same exact wiring, but the
- * "stage" is the full viewport so the loupe can roam the whole page.
- *
- * Lens geometry: a true 240 x 240 circle (radius 120) — round, thick,
- * substantial, matching the demo's substantial feel.
- *
- * Scene: a full-viewport page mirror (dark obsidian base, the hero's
- * purple/orange/teal radial blooms, a 23px white-6% dot grid, and the
- * hero's ghost type) so the refracted copy reads as a real page rather
- * than a flat gradient.
+ * Adjustments on top of the demo:
+ *  - Round, thick 192 x 192 lens (r=96) — 20% smaller than 240, still
+ *    substantial enough to read as solid glass material
+ *  - Subtle white tint veil via unstable_lens so the material registers
+ *    clearly against the dark hero / section gradients
+ *  - Opacity fades out 500ms after the cursor stops moving, fades back in
+ *    instantly on the next move (no drift-in from centre, no jump)
  */
 
-// ── Lens geometry ──────────────────────────────────────────────────────────
-const LENS_SIZE = 240; // full px — round, thick
+// ── Lens geometry (round, 20% smaller than the previous 240) ──────────────
+const LENS_SIZE = 192; // full px — round, thick
 const LENS_RADIUS = LENS_SIZE / 2;
 
-// ── Optics: verbatim from the demo's DEFAULT_LENS (Playground.tsx) ─────────
+// ── Optics: verbatim from the demo's DEFAULT_LENS ─────────────────────────
 const DEMO_OPTICS = {
   // shape
   mapSize: 512,
@@ -66,9 +55,8 @@ const DEMO_OPTICS = {
 } as const;
 
 /**
- * The <Scene> the lens refracts. Modelled on the demo's Scene: a
- * page-like surface (bg color + dot grid + content) so the refracted
- * copy reads as a real page, not a flat gradient.
+ * The <Scene> the lens refracts. Demo pattern: page bg + dot grid +
+ * content, so the refracted copy reads as a real page.
  */
 function PageScene() {
   return (
@@ -93,8 +81,7 @@ function PageScene() {
       }}
     >
       {/* Ghost type — a few dim headlines so the refracted copy reads
-          as a page-with-content rather than a flat field. Low contrast
-          on purpose (the lens's bend + sheen are the visual focus). */}
+          as a page-with-content rather than a flat field. */}
       <div
         style={{
           position: 'absolute',
@@ -169,11 +156,17 @@ function PageScene() {
   );
 }
 
+// Fade-out grace period after the cursor stops moving.
+const IDLE_FADE_MS = 500;
+// Fade-in is instant (no animation) so the loupe pops into view under
+// the cursor. Fade-out is smooth so it doesn't snap away.
+const FADE_OUT_MS = 350;
+
 /**
- * The loupe. Cursor following is wired exactly like the demo: the
- * `center` prop takes 0..1 motion values that an rAF loop eases towards
- * the cursor. Touch-only devices are skipped (a sticky loupe breaks
- * scroll/tap).
+ * The loupe. Cursor following uses the demo's pattern (glassValue motion
+ * values for centre, eased via rAF). Adds an opacity fade-out after the
+ * cursor rests — pointer-events: none keeps it harmless whether visible
+ * or not.
  */
 export function CursorGlass() {
   const x = useMemo(() => glassValue(0.5), []);
@@ -182,13 +175,17 @@ export function CursorGlass() {
   const visibleRef = useRef(false);
   const enabledRef = useRef(true);
 
+  // 1 = visible, 0 = hidden. Driven by the cursor-rest timer below.
+  const [opacity, setOpacity] = useState(0);
+  const fadeTimerRef = useRef<number | null>(null);
+
   useEffect(() => {
     if (typeof window !== 'undefined') {
       enabledRef.current = window.matchMedia('(hover: hover) and (pointer: fine)').matches;
     }
   }, []);
 
-  // rAF loop: ease centre towards cursor target.
+  // rAF loop: ease centre towards the cursor target.
   useEffect(() => {
     if (!enabledRef.current) return;
     let raf = 0;
@@ -210,7 +207,7 @@ export function CursorGlass() {
     return () => cancelAnimationFrame(raf);
   }, [x, y]);
 
-  // Track the cursor as a 0..1 fraction of the viewport.
+  // Track the cursor: 0..1 fraction of the viewport, plus the idle fade.
   useEffect(() => {
     if (!enabledRef.current) return;
     const onMove = (e: PointerEvent) => {
@@ -218,15 +215,38 @@ export function CursorGlass() {
       const ty = e.clientY / window.innerHeight;
       targetRef.current = { x: tx, y: ty };
       if (!visibleRef.current) {
-        // Snap on the first move so the loupe appears under the cursor
-        // instead of drifting in from the screen centre.
         x.set(tx);
         y.set(ty);
         visibleRef.current = true;
       }
+      // Show the loupe, schedule the fade-out.
+      setOpacity(1);
+      if (fadeTimerRef.current !== null) {
+        window.clearTimeout(fadeTimerRef.current);
+      }
+      fadeTimerRef.current = window.setTimeout(() => {
+        setOpacity(0);
+        fadeTimerRef.current = null;
+      }, IDLE_FADE_MS);
+    };
+    const onLeave = () => {
+      // Cursor left the window — hide immediately so the loupe
+      // doesn't sit orphaned at the last edge position.
+      if (fadeTimerRef.current !== null) {
+        window.clearTimeout(fadeTimerRef.current);
+        fadeTimerRef.current = null;
+      }
+      setOpacity(0);
     };
     window.addEventListener('pointermove', onMove, { passive: true });
-    return () => window.removeEventListener('pointermove', onMove);
+    window.addEventListener('pointerleave', onLeave);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerleave', onLeave);
+      if (fadeTimerRef.current !== null) {
+        window.clearTimeout(fadeTimerRef.current);
+      }
+    };
   }, [x, y]);
 
   if (!enabledRef.current) return null;
@@ -240,6 +260,12 @@ export function CursorGlass() {
         inset: 0,
         pointerEvents: 'none',
         zIndex: 60,
+        // Instant fade-in (the loupe pops under the cursor), smooth fade-out
+        // when the cursor rests. The 0ms side preserves snappy re-entry.
+        opacity,
+        transition: opacity === 0
+          ? `opacity ${FADE_OUT_MS}ms cubic-bezier(0.4, 0, 0.2, 1)`
+          : 'opacity 0ms linear',
       }}
     >
       <Glass
@@ -251,6 +277,15 @@ export function CursorGlass() {
         width={LENS_SIZE}
         height={LENS_SIZE}
         radius={LENS_RADIUS}
+        // Subtle white tint veil — makes the material register clearly
+        // against the dark hero / section gradients without overcooking it.
+        unstable_lens={{
+          tintColor: 'white',
+          tintOpacity: 0.06,
+          tintBlur: 0,
+          restShadowOpacity: 1,
+          edgeBias: 0.5,
+        }}
         style={{ position: 'absolute', inset: 0 }}
       />
     </div>
